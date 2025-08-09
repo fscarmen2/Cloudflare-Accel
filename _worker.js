@@ -1,4 +1,7 @@
-// 更新日期: 2025-08-08，更新内容: 为页面函数转换为模块语法
+// 更新日期: 2025-08-09
+// 更新内容: 
+// 1. 无论是否重定向，只要目标是 AWS S3，就自动补全 x-amz-content-sha256 和 x-amz-date
+// 2. 改进Docker镜像路径处理逻辑，支持多种格式:
 
 // 用户配置区域开始 =================================
 // 以下变量用于配置代理服务的白名单和安全设置，可根据需求修改。
@@ -222,12 +225,12 @@ const HOMEPAGE_HTML = `
     <!-- Docker 镜像加速 -->
     <div class="section-box">
       <h2 class="text-xl font-semibold mb-2">🐳 Docker 镜像加速</h2>
-      <p class="text-gray-600 dark:text-gray-300 mb-4">输入原镜像地址（如 nginx 或 ghcr.io/user/repo），获取加速拉取命令。</p>
+      <p class="text-gray-600 dark:text-gray-300 mb-4">输入原镜像地址（如 hello-world 或 ghcr.io/user/repo），获取加速拉取命令。</p>
       <div class="flex gap-2 mb-2">
         <input
           id="docker-image"
           type="text"
-          placeholder="请输入镜像地址，例如：nginx 或 ghcr.io/user/repo"
+          placeholder="请输入镜像地址，例如：hello-world 或 ghcr.io/user/repo"
           class="flex-grow p-2 border border-gray-400 dark:border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:text-white placeholder-gray-400 dark:placeholder-gray-500"
         >
         <button
@@ -422,6 +425,28 @@ async function handleToken(realm, service, scope) {
   }
 }
 
+function isAmazonS3(url) {
+  try {
+    return new URL(url).hostname.includes('amazonaws.com');
+  } catch {
+    return false;
+  }
+}
+
+// 计算请求体的 SHA256 哈希值
+async function calculateSHA256(message) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(message);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// 获取空请求体的 SHA256 哈希值
+function getEmptyBodySHA256() {
+  return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+}
+
 async function handleRequest(request, redirectCount = 0) {
   const MAX_REDIRECTS = 5; // 最大重定向次数
   const url = new URL(request.url);
@@ -440,9 +465,21 @@ async function handleRequest(request, redirectCount = 0) {
 
   // 处理 Docker V2 API 或 GitHub 代理请求
   let isV2Request = false;
+  let v2RequestType = null; // 'manifests' or 'blobs'
+  let v2RequestTag = null;  // tag or digest
   if (path.startsWith('/v2/')) {
     isV2Request = true;
     path = path.replace('/v2/', '');
+
+    // 解析 V2 API 请求类型和标签/摘要
+    const pathSegments = path.split('/').filter(part => part);
+    if (pathSegments.length >= 3) {
+      // 格式如: nginx/manifests/latest 或 nginx/blobs/sha256:xxx
+      v2RequestType = pathSegments[pathSegments.length - 2];
+      v2RequestTag = pathSegments[pathSegments.length - 1];
+      // 提取镜像名称部分（去掉 manifests/tag 或 blobs/digest 部分）
+      path = pathSegments.slice(0, pathSegments.length - 2).join('/');
+    }
   }
 
   // 提取目标域名和路径
@@ -463,19 +500,46 @@ async function handleRequest(request, redirectCount = 0) {
     targetPath = urlObj.pathname.substring(1) + urlObj.search; // 移除开头的斜杠
 
     // 检查是否为 Docker 请求
-    isDockerRequest = ['quay.io', 'gcr.io', 'k8s.gcr.io', 'registry.k8s.io', 'ghcr.io', 'docker.cloudsmith.io', 'registry-1.docker.io'].includes(targetDomain);
+    isDockerRequest = ['quay.io', 'gcr.io', 'k8s.gcr.io', 'registry.k8s.io', 'ghcr.io', 'docker.cloudsmith.io', 'registry-1.docker.io', 'docker.io'].includes(targetDomain);
+
+    // 处理 docker.io 域名，转换为 registry-1.docker.io
+    if (targetDomain === 'docker.io') {
+      targetDomain = 'registry-1.docker.io';
+    }
   } else {
-    // 原有的处理逻辑
-    if (!ALLOWED_HOSTS.includes(pathParts[0])) {
-      // Docker Hub 默认命名空间（如 nginx）
+    // 处理 Docker 镜像路径的多种格式
+    if (pathParts[0] === 'docker.io') {
+      // 处理 docker.io/library/nginx 或 docker.io/amilys/embyserver 格式
       isDockerRequest = true;
       targetDomain = 'registry-1.docker.io';
-      targetPath = `library/${pathParts.join('/')}`;
-    } else {
+
+      if (pathParts.length === 2) {
+        // 处理 docker.io/nginx 格式，添加 library 命名空间
+        targetPath = `library/${pathParts[1]}`;
+      } else {
+        // 处理 docker.io/amilys/embyserver 或 docker.io/library/nginx 格式
+        targetPath = pathParts.slice(1).join('/');
+      }
+    } else if (ALLOWED_HOSTS.includes(pathParts[0])) {
       // Docker 镜像仓库（如 ghcr.io）或 GitHub 域名（如 github.com）
       targetDomain = pathParts[0];
       targetPath = pathParts.slice(1).join('/') + url.search;
       isDockerRequest = ['quay.io', 'gcr.io', 'k8s.gcr.io', 'registry.k8s.io', 'ghcr.io', 'docker.cloudsmith.io', 'registry-1.docker.io'].includes(targetDomain);
+    } else if (pathParts.length >= 1 && pathParts[0] === 'library') {
+      // 处理 library/nginx 格式
+      isDockerRequest = true;
+      targetDomain = 'registry-1.docker.io';
+      targetPath = pathParts.join('/');
+    } else if (pathParts.length >= 2) {
+      // 处理 amilys/embyserver 格式（带命名空间但不是 library）
+      isDockerRequest = true;
+      targetDomain = 'registry-1.docker.io';
+      targetPath = pathParts.join('/');
+    } else {
+      // 处理单个镜像名称，如 nginx
+      isDockerRequest = true;
+      targetDomain = 'registry-1.docker.io';
+      targetPath = `library/${pathParts.join('/')}`;
     }
   }
 
@@ -499,33 +563,38 @@ async function handleRequest(request, redirectCount = 0) {
   }
 
   // 构建目标 URL
-  const targetUrl = isDockerRequest
-    ? `https://${targetDomain}/${isV2Request ? 'v2/' : ''}${targetPath}`
-    : `https://${targetDomain}/${targetPath}`;
-  console.log(`Target URL: ${targetUrl}`);
-
-  // 处理 /v2/ 根请求（Docker 特有）
-  if (isDockerRequest && isV2Request && targetPath === '') {
-    console.log('Handling /v2/ root request');
-    return new Response('{}', {
-      status: 200,
-      headers: { 'Docker-Distribution-API-Version': 'registry/2.0' }
-    });
+  let targetUrl;
+  if (isDockerRequest) {
+    if (isV2Request && v2RequestType && v2RequestTag) {
+      // 重构 V2 API URL
+      targetUrl = `https://${targetDomain}/v2/${targetPath}/${v2RequestType}/${v2RequestTag}`;
+    } else {
+      targetUrl = `https://${targetDomain}/${isV2Request ? 'v2/' : ''}${targetPath}`;
+    }
+  } else {
+    targetUrl = `https://${targetDomain}/${targetPath}`;
   }
 
-  // 创建请求
   const newRequestHeaders = new Headers(request.headers);
   newRequestHeaders.set('Host', targetDomain);
-  const newRequest = new Request(targetUrl, {
-    method: request.method,
-    headers: newRequestHeaders,
-    body: request.body,
-    redirect: 'follow' // 改为 follow 以支持 GitHub 反向代理
-  });
+  newRequestHeaders.delete('x-amz-content-sha256');
+  newRequestHeaders.delete('x-amz-date');
+  newRequestHeaders.delete('x-amz-security-token');
+  newRequestHeaders.delete('x-amz-user-agent');
+
+  if (isAmazonS3(targetUrl)) {
+    newRequestHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
+    newRequestHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
+  }
 
   try {
-    // 尝试直接请求
-    let response = await fetch(newRequest);
+    // 尝试直接请求（注意：使用 manual 重定向以便我们能拦截到 307 并自己请求 S3）
+    let response = await fetch(targetUrl, {
+      method: request.method,
+      headers: newRequestHeaders,
+      body: request.body,
+      redirect: 'manual'
+    });
     console.log(`Initial response: ${response.status} ${response.statusText}`);
 
     // 处理 Docker 认证挑战
@@ -542,11 +611,22 @@ async function handleRequest(request, redirectCount = 0) {
             const authHeaders = new Headers(request.headers);
             authHeaders.set('Authorization', `Bearer ${token}`);
             authHeaders.set('Host', targetDomain);
+            // 如果目标是 S3，添加必要的 x-amz 头；否则删除可能干扰的头部
+            if (isAmazonS3(targetUrl)) {
+              authHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
+              authHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
+            } else {
+              authHeaders.delete('x-amz-content-sha256');
+              authHeaders.delete('x-amz-date');
+              authHeaders.delete('x-amz-security-token');
+              authHeaders.delete('x-amz-user-agent');
+            }
+
             const authRequest = new Request(targetUrl, {
               method: request.method,
               headers: authHeaders,
               body: request.body,
-              redirect: 'follow'
+              redirect: 'manual'
             });
             console.log('Retrying with token');
             response = await fetch(authRequest);
@@ -556,11 +636,22 @@ async function handleRequest(request, redirectCount = 0) {
             const anonHeaders = new Headers(request.headers);
             anonHeaders.delete('Authorization');
             anonHeaders.set('Host', targetDomain);
+            // 如果目标是 S3，添加必要的 x-amz 头；否则删除可能干扰的头部
+            if (isAmazonS3(targetUrl)) {
+              anonHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
+              anonHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
+            } else {
+              anonHeaders.delete('x-amz-content-sha256');
+              anonHeaders.delete('x-amz-date');
+              anonHeaders.delete('x-amz-security-token');
+              anonHeaders.delete('x-amz-user-agent');
+            }
+
             const anonRequest = new Request(targetUrl, {
               method: request.method,
               headers: anonHeaders,
               body: request.body,
-              redirect: 'follow'
+              redirect: 'manual'
             });
             response = await fetch(anonRequest);
             console.log(`Anonymous response: ${response.status} ${response.statusText}`);
@@ -578,7 +669,7 @@ async function handleRequest(request, redirectCount = 0) {
       const redirectUrl = response.headers.get('Location');
       if (redirectUrl && redirectUrl.includes('amazonaws.com')) {
         console.log(`S3 redirect detected: ${redirectUrl}`);
-        const EMPTY_BODY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+        const EMPTY_BODY_SHA256 = getEmptyBodySHA256();
         const redirectHeaders = new Headers(request.headers);
         redirectHeaders.set('x-amz-content-sha256', EMPTY_BODY_SHA256);
         redirectHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
@@ -591,7 +682,7 @@ async function handleRequest(request, redirectCount = 0) {
           method: request.method,
           headers: redirectHeaders,
           body: request.body,
-          redirect: 'follow'
+          redirect: 'manual'
         });
         response = await fetch(redirectRequest);
         console.log(`S3 redirect response: ${response.status} ${response.statusText}`);
