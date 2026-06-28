@@ -1,0 +1,9 @@
+name = "cloudflare-accel"
+main = "_worker.js"
+compatibility_date = "2025-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# 路由配置
+routes = [
+  { pattern = "*", script = "cloudflare-accel" }
+]

@@ -1,9 +1,12 @@
-// 更新日期: 2025-08-25
-// 更新内容: 
+// 更新日期: 2026-06-28
+// 更新内容:
 // 1. 无论是否重定向，只要目标是 AWS S3，就自动补全 x-amz-content-sha256 和 x-amz-date
 // 2. 改进Docker镜像路径处理逻辑，支持多种格式: 如 hello-world | library/hello-world | docker.io/library/hello-world
 // 3. 解决大陆拉取第三方 Docker 镜像层失败的问题，自动递归处理所有 302/307 跳转，无论跳转到哪个域名，都由 Worker 继续反代，避免客户端直接访问被墙 CDN，从而提升拉取成功率
 // 4. 感谢老王，处理了暗黑模式下，输入框的颜色显示问题
+// 5. 支持 Git smart-http 协议代理，解决 git clone 时 GitHub 返回 dumb-http 403 错误
+// 6. 支持 GitLab 系列域名（gitlab.com 等）的 git clone 加速
+// 7. 首页新增 Git Clone 加速功能模块，方便生成加速命令
 // 用户配置区域开始 =================================
 // 以下变量用于配置代理服务的白名单和安全设置，可根据需求修改。
 
@@ -24,7 +27,13 @@ const ALLOWED_HOSTS = [
   'api.github.com',
   'raw.githubusercontent.com',
   'gist.github.com',
-  'gist.githubusercontent.com'
+  'gist.githubusercontent.com',
+  'gitlab.com',
+  'gitlab.freedesktop.org',
+  'gitlab.gnome.org',
+  'gitlab.kitware.com',
+  'gitlab.archlinux.org',
+  'gitlab.postmarketos.org'
 ];
 
 // RESTRICT_PATHS: 控制是否限制 GitHub 和 Docker 请求的路径。
@@ -210,16 +219,17 @@ const HOMEPAGE_HTML = `
 
     <!-- GitHub 链接转换 -->
     <div class="section-box">
-      <h2 class="text-xl font-semibold mb-2">⚡ GitHub 文件加速</h2>
-      <p class="text-gray-600 dark:text-gray-300 mb-4">输入 GitHub 文件链接，自动转换为加速链接。也可以直接在链接前加上本站域名使用。</p>
+      <h2 class="text-xl font-semibold mb-2">⚡ GitHub 文件加速 / Git Clone</h2>
+      <p class="text-gray-600 dark:text-gray-300 mb-4">输入 GitHub 文件链接获取加速链接；输入以 .git 结尾的仓库地址则自动生成 git clone 加速命令。</p>
       <div class="flex gap-2 mb-2">
         <input
           id="github-url"
           type="text"
-          placeholder="请输入 GitHub 文件链接，例如：https://github.com/user/repo/releases/..."
+          placeholder="请输入 GitHub 文件链接或 .git 仓库地址，例如：https://github.com/user/repo/releases/..."
           class="flex-grow p-2 border border-gray-400 dark:border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500"
         >
         <button
+          id="github-submit-btn"
           onclick="convertGithubUrl()"
           class="bg-blue-500 text-white px-4 py-2 rounded-lg hover:bg-blue-600 transition"
         >
@@ -228,7 +238,7 @@ const HOMEPAGE_HTML = `
       </div>
       <p id="github-result" class="mt-2 text-green-600 dark:text-green-400 result-text hidden"></p>
       <div id="github-buttons" class="flex gap-2 mt-2 github-buttons hidden">
-        <button onclick="copyGithubUrl()" class="bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-200 px-3 py-1 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-500 transition w-full">📋 复制链接</button>
+        <button onclick="copyGithubUrl()" class="bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-200 px-3 py-1 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-500 transition w-full">📋 复制</button>
         <button onclick="openGithubUrl()" class="bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-200 px-3 py-1 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-500 transition w-full">🔗 打开链接</button>
       </div>
     </div>
@@ -334,12 +344,16 @@ const HOMEPAGE_HTML = `
 
     // GitHub 链接转换
     let githubAcceleratedUrl = '';
+    let githubIsGitMode = false;
     function convertGithubUrl() {
       const input = document.getElementById('github-url').value.trim();
       const result = document.getElementById('github-result');
       const buttons = document.getElementById('github-buttons');
+      const submitBtn = document.getElementById('github-submit-btn');
+      const copyBtn = buttons.children[0];
+      const openBtn = buttons.children[1];
       if (!input) {
-        showToast('请输入有效的 GitHub 链接', true);
+        showToast('请输入有效的链接', true);
         result.classList.add('hidden');
         buttons.classList.add('hidden');
         return;
@@ -351,11 +365,37 @@ const HOMEPAGE_HTML = `
         return;
       }
 
+      // 检测是否以 .git 结尾，如果是则输出 git clone 指令
+      if (input.endsWith('.git')) {
+        githubIsGitMode = true;
+        submitBtn.textContent = '获取加速命令';
+        const domainPath = input.substring(8); // 去掉 https://
+        const proxyUrl = 'https://' + currentDomain + '/https://' + domainPath;
+        githubAcceleratedUrl = 'git clone ' + proxyUrl;
+        result.textContent = '加速命令: ' + githubAcceleratedUrl;
+        result.classList.remove('hidden');
+        buttons.classList.remove('hidden');
+        copyBtn.textContent = '📋 复制命令';
+        // .git 模式隐藏"打开链接"按钮
+        if (openBtn) openBtn.classList.add('hidden');
+        copyToClipboard(githubAcceleratedUrl).then(() => {
+          showToast('已复制到剪贴板');
+        }).catch(err => {
+          showToast('复制失败: ' + err.message, true);
+        });
+        return;
+      }
+
+      githubIsGitMode = false;
+      submitBtn.textContent = '获取加速链接';
       // 保持现有格式：域名/https://原始链接
       githubAcceleratedUrl = 'https://' + currentDomain + '/https://' + input.substring(8);
       result.textContent = '加速链接: ' + githubAcceleratedUrl;
       result.classList.remove('hidden');
       buttons.classList.remove('hidden');
+      copyBtn.textContent = '📋 复制链接';
+      // 正常模式显示"打开链接"按钮
+      if (openBtn) openBtn.classList.remove('hidden');
       copyToClipboard(githubAcceleratedUrl).then(() => {
         showToast('已复制到剪贴板');
       }).catch(err => {
@@ -365,14 +405,16 @@ const HOMEPAGE_HTML = `
 
     function copyGithubUrl() {
       copyToClipboard(githubAcceleratedUrl).then(() => {
-        showToast('已手动复制到剪贴板');
+        showToast('已复制到剪贴板');
       }).catch(err => {
-        showToast('手动复制失败: ' + err.message, true);
+        showToast('复制失败: ' + err.message, true);
       });
     }
 
     function openGithubUrl() {
-      window.open(githubAcceleratedUrl, '_blank');
+      if (!githubIsGitMode) {
+        window.open(githubAcceleratedUrl, '_blank');
+      }
     }
 
     // Docker 镜像转换
@@ -458,6 +500,58 @@ function getEmptyBodySHA256() {
   return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 }
 
+// 检测是否为 Git smart-http 协议请求
+function isGitRequest(request, targetDomain) {
+  // 检查 User-Agent 是否包含 git/
+  const ua = request.headers.get('User-Agent') || '';
+  if (ua.toLowerCase().includes('git/')) {
+    return true;
+  }
+  // 检查目标域名是否为 Git 托管平台
+  const gitDomains = ['github.com', 'api.github.com', 'raw.githubusercontent.com', 'gist.github.com', 'gist.githubusercontent.com', 'gitlab.com', 'gitlab.freedesktop.org', 'gitlab.gnome.org', 'gitlab.kitware.com', 'gitlab.archlinux.org', 'gitlab.postmarketos.org'];
+  if (gitDomains.includes(targetDomain)) {
+    // 检查路径是否包含 Git 协议特征
+    const url = new URL(request.url);
+    const path = url.pathname;
+    // Git smart-http 使用 /info/refs?service=git-upload-pack 或 /git-upload-pack
+    if (path.includes('/info/refs') || path.includes('/git-upload-pack') || path.includes('/git-receive-pack')) {
+      return true;
+    }
+    // 路径包含 .git 也可能是 Git 请求（如 /user/repo.git/...）
+    if (path.includes('.git')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 为 Git 请求构建正确的代理请求头
+function buildGitHeaders(request, targetDomain) {
+  const headers = new Headers(request.headers);
+
+  // 设置正确的 Host
+  headers.set('Host', targetDomain);
+
+  // 删除可能干扰 Git 协议的 Cloudflare 特定头部
+  headers.delete('CF-Connecting-IP');
+  headers.delete('CF-IPCountry');
+  headers.delete('CF-Ray');
+  headers.delete('CF-Visitor');
+  headers.delete('CF-Worker');
+  headers.delete('X-Forwarded-For');
+  headers.delete('X-Real-IP');
+  headers.delete('X-Forwarded-Proto');
+  headers.delete('X-Forwarded-Host');
+
+  // 删除 AWS S3 相关头部（不相关）
+  headers.delete('x-amz-content-sha256');
+  headers.delete('x-amz-date');
+  headers.delete('x-amz-security-token');
+  headers.delete('x-amz-user-agent');
+
+  return headers;
+}
+
 async function handleRequest(request, redirectCount = 0) {
   const MAX_REDIRECTS = 5; // 最大重定向次数
   const url = new URL(request.url);
@@ -502,7 +596,8 @@ async function handleRequest(request, redirectCount = 0) {
   let targetDomain, targetPath, isDockerRequest = false;
 
   // 检查路径是否以 https:// 或 http:// 开头
-  const fullPath = path.startsWith('/') ? path.substring(1) : path;
+  // 注意：需要包含原始请求的查询参数（如 ?service=git-upload-pack），否则会丢失
+  const fullPath = (path.startsWith('/') ? path.substring(1) : path) + url.search;
 
   if (fullPath.startsWith('https://') || fullPath.startsWith('http://')) {
     // 处理 /https://domain.com/... 或 /http://domain.com/... 格式
@@ -517,6 +612,8 @@ async function handleRequest(request, redirectCount = 0) {
     if (targetDomain === 'docker.io') {
       targetDomain = 'registry-1.docker.io';
     }
+
+
   } else {
     // 处理 Docker 镜像路径的多种格式
     if (pathParts[0] === 'docker.io') {
@@ -586,27 +683,39 @@ async function handleRequest(request, redirectCount = 0) {
     targetUrl = `https://${targetDomain}/${targetPath}`;
   }
 
-  const newRequestHeaders = new Headers(request.headers);
-  newRequestHeaders.set('Host', targetDomain);
-  newRequestHeaders.delete('x-amz-content-sha256');
-  newRequestHeaders.delete('x-amz-date');
-  newRequestHeaders.delete('x-amz-security-token');
-  newRequestHeaders.delete('x-amz-user-agent');
+  // 检测是否为 Git smart-http 请求
+  const isGit = isGitRequest(request, targetDomain);
 
-  if (isAmazonS3(targetUrl)) {
-    newRequestHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
-    newRequestHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
+  let newRequestHeaders;
+  if (isGit) {
+    // Git 请求：使用白名单方式保留关键头部，避免 Cloudflare 添加的额外头部干扰 Git 协议
+    newRequestHeaders = buildGitHeaders(request, targetDomain);
+  } else {
+    newRequestHeaders = new Headers(request.headers);
+    newRequestHeaders.set('Host', targetDomain);
+    newRequestHeaders.delete('x-amz-content-sha256');
+    newRequestHeaders.delete('x-amz-date');
+    newRequestHeaders.delete('x-amz-security-token');
+    newRequestHeaders.delete('x-amz-user-agent');
+
+    if (isAmazonS3(targetUrl)) {
+      newRequestHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
+      newRequestHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
+    }
   }
 
   try {
-    // 尝试直接请求（注意：使用 manual 重定向以便我们能拦截到 307 并自己请求 S3）
+    // Git 请求使用 follow 重定向，让 Cloudflare 自动跟随重定向
+    // 非 Git 请求使用 manual 重定向以便拦截 307 并自己请求 S3
+    const redirectMode = isGit ? 'follow' : 'manual';
+
     let response = await fetch(targetUrl, {
       method: request.method,
       headers: newRequestHeaders,
       body: request.body,
-      redirect: 'manual'
+      redirect: redirectMode
     });
-    console.log(`Initial response: ${response.status} ${response.statusText}`);
+    console.log(`Initial response: ${response.status} ${response.statusText} [git=${isGit}]`);
 
     // 处理 Docker 认证挑战
     if (isDockerRequest && response.status === 401) {
@@ -680,16 +789,16 @@ async function handleRequest(request, redirectCount = 0) {
       const redirectUrl = response.headers.get('Location');
       if (redirectUrl) {
         console.log(`Redirect detected: ${redirectUrl}`);
-        const EMPTY_BODY_SHA256 = getEmptyBodySHA256();
         const redirectHeaders = new Headers(request.headers);
         redirectHeaders.set('Host', new URL(redirectUrl).hostname);
-        
-        // 对于任何重定向，都添加必要的AWS头（如果需要）
+
+        // 对于 S3 重定向，添加必要的 AWS 头
         if (isAmazonS3(redirectUrl)) {
+          const EMPTY_BODY_SHA256 = getEmptyBodySHA256();
           redirectHeaders.set('x-amz-content-sha256', EMPTY_BODY_SHA256);
           redirectHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
         }
-        
+
         if (response.headers.get('Authorization')) {
           redirectHeaders.set('Authorization', response.headers.get('Authorization'));
         }
@@ -717,11 +826,27 @@ async function handleRequest(request, redirectCount = 0) {
     const newResponse = new Response(response.body, response);
     newResponse.headers.set('Access-Control-Allow-Origin', '*');
     newResponse.headers.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
+
     if (isDockerRequest) {
       newResponse.headers.set('Docker-Distribution-API-Version', 'registry/2.0');
       // 删除可能存在的重定向头，确保所有请求都通过Worker处理
       newResponse.headers.delete('Location');
     }
+
+    // Git smart-http 特殊处理：
+    // 1. 保留 Location 头（Git 需要处理重定向）
+    // 2. 保留原始 Content-Type（如 application/x-git-upload-pack-advertisement）
+    // 3. 保留 Transfer-Encoding（Git 需要 chunked 编码）
+    if (isGit) {
+      // Git 需要原始的响应头，不要删除 Location
+      // 确保 Content-Type 不被修改
+      const contentType = response.headers.get('Content-Type');
+      if (contentType && contentType.includes('x-git-')) {
+        // Git smart-http 响应，保持原样
+        console.log(`Git smart-http response: ${response.status} ${contentType}`);
+      }
+    }
+
     return newResponse;
   } catch (error) {
     console.log(`Fetch error: ${error.message}`);
